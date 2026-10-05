@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
   asIsValue,
+  cashCoverage,
+  compareQuote,
   computeAll,
+  horizonMonths,
   lowestTwelveMonth,
   monthlyPayment,
   sensitivity,
@@ -17,7 +20,6 @@ const base: Inputs = {
   loanBalance: 0,
   loanPayment: 0,
   cashAvailable: 2000,
-  keepMonths: 36,
   safeToDrive: "yes",
 };
 
@@ -68,7 +70,7 @@ describe("replace", () => {
     const r = computeAll(base, a).replace;
     expect(r.upfront).toBe(0);
     expect(r.twelveMonthLow).toBeCloseTo(12 * monthlyPayment(20000, 0.11, 60) + 500, 2);
-    expect(r.notes).toHaveLength(0);
+    expect(r.notes).toEqual([expect.stringMatching(/^New loan: about \$\d/)]); // no negative-equity note
   });
 
   it("negative equity: full down + fees upfront, shortfall rolled into the loan and flagged", () => {
@@ -77,6 +79,77 @@ describe("replace", () => {
     expect(r.upfront).toBe(4500);
     expect(r.twelveMonthLow).toBeCloseTo(4500 + 12 * monthlyPayment(24500, 0.11, 60) + 500, 2);
     expect(r.notes[0]).toMatch(/\$2,000 more/);
+    expect(r.notes[1]).toMatch(/^New loan: about \$\d/);
+  });
+});
+
+describe("how long you keep it", () => {
+  it("no answer means no per-month spread", () => {
+    expect(computeAll(base, a).repair.spreadPerMonth).toBeUndefined();
+  });
+
+  it("spreads one-time costs over the months you keep the car", () => {
+    const r = computeAll({ ...base, keep: 36 }, a);
+    expect(r.repair.spreadPerMonth).toEqual({ low: 3000 / 36, high: 3000 / 36, months: 36 });
+    // second opinion: diag + (savings case .. confirmed quote)
+    expect(r.secondOpinion.spreadPerMonth).toEqual({ low: (150 + 2400) / 36, high: (150 + 3000) / 36, months: 36 });
+    expect(r.replace.spreadPerMonth).toBeUndefined();
+  });
+
+  it("'as long as it runs' uses the editable foreverYears assumption", () => {
+    expect(horizonMonths("forever", a)).toBe(8 * 12);
+    expect(horizonMonths("forever", { ...a, foreverYears: 15 })).toBe(180);
+    const r = computeAll({ ...base, keep: "forever" }, a);
+    expect(r.repair.spreadPerMonth?.low).toBeCloseTo(3000 / 96, 6);
+  });
+
+  it("doesn't change the 12-month numbers", () => {
+    const withKeep = computeAll({ ...base, keep: "forever" }, a);
+    const without = computeAll(base, a);
+    for (const id of ["repair", "secondOpinion", "replace"] as const) {
+      expect(withKeep[id].twelveMonthLow).toBe(without[id].twelveMonthLow);
+      expect(withKeep[id].twelveMonthHigh).toBe(without[id].twelveMonthHigh);
+    }
+  });
+});
+
+describe("price check feeds the second opinion", () => {
+  it("best case uses the typical range's midpoint instead of the assumed savings", () => {
+    const s = computeAll({ ...base, typicalPrice: { low: 1800, high: 2200 } }, a).secondOpinion;
+    expect(s.twelveMonthLow).toBe(150 + 2000 + 1200);
+    expect(s.twelveMonthHigh).toBe(150 + 3000 + 1200);
+    expect(s.notes[0]).toMatch(/price check/);
+  });
+
+  it("never assumes a second shop costs more than the quote", () => {
+    const s = computeAll({ ...base, typicalPrice: { low: 3500, high: 4500 } }, a).secondOpinion;
+    expect(s.twelveMonthLow).toBe(s.twelveMonthHigh);
+  });
+});
+
+describe("cashCoverage (fuel gauge)", () => {
+  it("is the share of the upfront cost your cash covers, capped at full", () => {
+    expect(cashCoverage(450, 900)).toBe(0.5);
+    expect(cashCoverage(2000, 900)).toBe(1);
+    expect(cashCoverage(0, 900)).toBe(0);
+    expect(cashCoverage(-50, 900)).toBe(0);
+  });
+  it("is full when nothing is due upfront", () => {
+    expect(cashCoverage(0, 0)).toBe(1);
+  });
+});
+
+describe("compareQuote", () => {
+  const typical = { low: 1800, high: 2200 };
+  it("above the range", () => {
+    expect(compareQuote(3000, typical)).toEqual({ position: "above", diff: 800, pct: 800 / 2200 });
+  });
+  it("within the range (edges included)", () => {
+    expect(compareQuote(1800, typical).position).toBe("within");
+    expect(compareQuote(2200, typical).position).toBe("within");
+  });
+  it("below the range", () => {
+    expect(compareQuote(1500, typical)).toEqual({ position: "below", diff: 300, pct: 300 / 1800 });
   });
 });
 
@@ -97,5 +170,19 @@ describe("sensitivity", () => {
     expect(keys).toContain("diagFee");
     expect(keys).toContain("indieSavingsPct");
     expect(flips.every((f) => f.lowestBefore === "secondOpinion" && f.lowestAfter === "repair")).toBe(true);
+  });
+
+  it("lists the price-check range when nudging it changes the answer", () => {
+    // The second-opinion range's midpoint beats repair-now only if the typical price is under
+    // quote − 2 × diag fee = $1,320. At $1,450 it isn't; 25% lower ($1,087.50) it is.
+    const inputs: Inputs = { ...base, quoteTotal: 1620, typicalPrice: { low: 1300, high: 1600 } };
+    const flips = sensitivity(inputs, a);
+    expect(flips.find((f) => f.key === "typicalPrice")).toMatchObject({
+      factor: 0.75,
+      lowestBefore: "repair",
+      lowestAfter: "secondOpinion",
+    });
+    // the assumed savings % no longer matters once a typical price is known
+    expect(flips.map((f) => f.key)).not.toContain("indieSavingsPct");
   });
 });
